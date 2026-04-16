@@ -1,0 +1,620 @@
+# GitHub Actions workflow to build v8dasm (V8 bytecode disassembler) for Linux and Windows.
+#
+# This builds V8 from source with disassembly/object-print patches applied,
+# then compiles v8dasm against the patched V8 static libraries.
+#
+# Trigger: manual dispatch (specify V8 version) or tag push.
+#
+# COST: Each build takes ~30-60 minutes per platform.
+#       Windows runners cost 2x Linux minutes.
+
+name: Build v8dasm
+
+on:
+  workflow_dispatch:
+    inputs:
+      v8_version:
+        description: 'V8 version to build against (e.g. 9.4.146.24)'
+        required: true
+        default: '9.4.146.24'
+      platforms:
+        description: 'Platforms to build'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - windows
+          - linux
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: v8dasm-build-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default V8 version when triggered by tag push (no inputs available)
+env:
+  DEFAULT_V8_VERSION: '9.4.146.24'
+
+jobs:
+  # ─── Linux Build ───
+  build-linux:
+    if: ${{ github.event.inputs.platforms != 'windows' }}
+    runs-on: ubuntu-22.04
+    env:
+      V8_VERSION: ${{ github.event.inputs.v8_version || '9.4.146.24' }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up variables
+        id: vars
+        run: |
+          VERSION="${V8_VERSION}"
+          BRANCH=$(echo "$VERSION" | cut -d'.' -f1,2)
+          MAJOR=$(echo "$VERSION" | cut -d'.' -f1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
+
+          # V8 < 10 bundles old jinja2 that uses collections.Mapping (removed in Python 3.10)
+          if [[ "$MAJOR" -lt 10 ]]; then
+            echo "python_version=3.9" >> "$GITHUB_OUTPUT"
+          else
+            echo "python_version=3.11" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.vars.outputs.python_version }}
+
+      - name: Cache depot_tools
+        uses: actions/cache@v5
+        with:
+          path: depot_tools
+          key: depot-tools-linux-v1
+
+      - name: Install depot_tools
+        run: |
+          if [[ ! -d depot_tools ]]; then
+            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
+          else
+            cd depot_tools
+            git reset --hard HEAD
+            git clean -fd
+            cd ..
+          fi
+          echo "$PWD/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Bootstrap depot_tools
+        run: |
+          cd depot_tools
+          ./gclient --version || true
+
+      - name: Cache V8 source
+        uses: actions/cache@v5
+        with:
+          path: |
+            v8src/.gclient
+            v8src/.gclient_entries
+            v8src/v8/.git
+          key: v8-source-linux-${{ steps.vars.outputs.branch }}
+          restore-keys: |
+            v8-source-linux-
+
+      - name: Fetch V8 source
+        run: |
+          mkdir -p v8src
+          cd v8src
+          if [[ ! -f .gclient ]]; then
+            fetch --no-history v8
+          fi
+
+      - name: Checkout V8 ${{ env.V8_VERSION }}
+        working-directory: v8src/v8
+        run: |
+          VERSION="${{ steps.vars.outputs.version }}"
+          BRANCH="${{ steps.vars.outputs.branch }}"
+
+          git fetch origin "refs/branch-heads/${BRANCH}:refs/remotes/branch-heads/${BRANCH}" || true
+          git fetch origin --tags || true
+
+          if ! git checkout -f "${VERSION}" 2>/dev/null; then
+            echo "Exact tag not found, using branch-heads/${BRANCH}"
+            git checkout -f "branch-heads/${BRANCH}"
+          fi
+
+          if [[ ! -f ".gn" ]]; then
+            git reset --hard HEAD
+            [[ -f ".gn" ]] || { echo "ERROR: V8 checkout failed"; exit 1; }
+          fi
+
+      - name: Sync dependencies
+        working-directory: v8src
+        run: gclient sync -D --no-history --shallow
+
+      - name: Install build dependencies
+        working-directory: v8src/v8
+        run: |
+          if [[ -f "build/install-build-deps.sh" ]]; then
+            sudo ./build/install-build-deps.sh --no-prompt --no-chromeos-fonts || true
+          fi
+          sudo apt-get update && sudo apt-get install -y build-essential cmake
+
+      - name: Patch jinja2 for Python 3.10+ compatibility
+        working-directory: v8src/v8
+        run: |
+          find third_party/jinja2 third_party/markupsafe -name '*.py' -exec \
+            sed -i 's/from collections import Mapping/from collections.abc import Mapping/g' {} + 2>/dev/null || true
+          find third_party/jinja2 -name '*.py' -exec \
+            sed -i 's/collections\.Mapping/collections.abc.Mapping/g' {} + 2>/dev/null || true
+
+      - name: Apply v8dasm disassembly patches
+        working-directory: v8src/v8
+        run: |
+          chmod +x "${{ github.workspace }}/patches/apply-v8-patches.sh"
+          "${{ github.workspace }}/patches/apply-v8-patches.sh" "$PWD"
+
+      - name: Build V8 (static library with disassembler)
+        working-directory: v8src/v8
+        run: |
+          # Find gn binary
+          GN_BIN=""
+          for candidate in "buildtools/linux64/gn" "third_party/gn/gn"; do
+            if [[ -f "$candidate" && -x "$candidate" ]] && file "$candidate" | grep -q "ELF"; then
+              GN_BIN="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$GN_BIN" ]]; then
+            mkdir -p buildtools/linux64
+            curl -sL "https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/latest" -o /tmp/gn.zip
+            unzip -o /tmp/gn.zip -d buildtools/linux64/
+            chmod +x buildtools/linux64/gn
+            GN_BIN="buildtools/linux64/gn"
+          fi
+
+          # Find ninja
+          NINJA_BIN=""
+          if [[ -f "third_party/ninja/ninja" && -x "third_party/ninja/ninja" ]]; then
+            NINJA_BIN="third_party/ninja/ninja"
+          elif command -v ninja &>/dev/null; then
+            NINJA_BIN="ninja"
+          else
+            sudo apt-get install -y ninja-build
+            NINJA_BIN="ninja"
+          fi
+
+          echo "Using gn: $GN_BIN"
+          echo "Using ninja: $NINJA_BIN"
+
+          $GN_BIN gen out/x64.release --args='
+            is_debug = false
+            target_cpu = "x64"
+            v8_enable_backtrace = true
+            v8_enable_slow_dchecks = false
+            v8_optimized_debug = false
+            is_component_build = false
+            v8_static_library = true
+            v8_enable_disassembler = true
+            v8_enable_object_print = true
+            use_custom_libcxx = false
+            v8_use_external_startup_data = false
+            is_clang = true
+            treat_warnings_as_errors = false
+          '
+
+          $NINJA_BIN -C out/x64.release wee8 v8_libbase v8_libplatform
+
+      - name: Build v8dasm
+        run: |
+          # Set up directory structure expected by CMakeLists.txt
+          # CMakeLists.txt expects ./v8/v8/include and ./v8/v8/out/...
+          mkdir -p build-dasm
+          ln -sfn "${{ github.workspace }}/v8src" build-dasm/v8
+          cp v8dasm.cpp build-dasm/
+          cp CMakeLists.txt build-dasm/
+
+          cd build-dasm
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DV8_OUT_DIR="${{ github.workspace }}/v8src/v8/out/x64.release"
+          cmake --build build --verbose
+
+          # Verify
+          file build/v8dasm
+          ldd build/v8dasm || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: v8dasm-linux-${{ env.V8_VERSION }}
+          path: build-dasm/build/v8dasm
+          retention-days: 90
+
+  # ─── Windows Build ───
+  build-windows:
+    if: ${{ github.event.inputs.platforms != 'linux' }}
+    runs-on: windows-2022
+    env:
+      V8_VERSION: ${{ github.event.inputs.v8_version || '9.4.146.24' }}
+      DEPOT_TOOLS_WIN_TOOLCHAIN: 0
+      VPYTHON_BYPASS: "manually managed python not using vpython"
+      GYP_MSVS_VERSION: "2019"
+      GYP_MSVS_OVERRIDE_PATH: "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise"
+      vs2022_install: "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up variables
+        id: vars
+        shell: bash
+        run: |
+          VERSION="${V8_VERSION}"
+          BRANCH=$(echo "$VERSION" | cut -d'.' -f1,2)
+          MAJOR=$(echo "$VERSION" | cut -d'.' -f1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
+
+          if [[ "$MAJOR" -lt 10 ]]; then
+            echo "python_version=3.9" >> "$GITHUB_OUTPUT"
+          else
+            echo "python_version=3.11" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.vars.outputs.python_version }}
+
+      - name: Cache depot_tools
+        uses: actions/cache@v5
+        with:
+          path: depot_tools
+          key: depot-tools-windows-v1
+
+      - name: Install depot_tools
+        shell: cmd
+        run: |
+          if not exist depot_tools\gclient.bat (
+            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
+          ) else (
+            cd depot_tools
+            git config core.autocrlf false
+            git reset --hard HEAD
+            git clean -fd
+            cd ..
+          )
+
+      - name: Add depot_tools to PATH
+        shell: pwsh
+        run: |
+          "${{ github.workspace }}\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "C:\Program Files\Git\cmd" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure git
+        shell: cmd
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.filemode false
+          git config --global core.symlinks false
+
+      - name: Cache V8 source
+        uses: actions/cache@v5
+        with:
+          path: |
+            v8src/.gclient
+            v8src/.gclient_entries
+            v8src/v8/.git
+          key: v8-source-windows-${{ steps.vars.outputs.branch }}
+          restore-keys: |
+            v8-source-windows-
+
+      - name: Fetch V8 source
+        shell: pwsh
+        run: |
+          if (!(Test-Path v8src)) { New-Item -ItemType Directory -Path v8src }
+          Set-Location v8src
+          if (!(Test-Path .gclient)) {
+            @"
+          solutions = [
+            {
+              "name": "v8",
+              "url": "https://chromium.googlesource.com/v8/v8.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_deps": {},
+            },
+          ]
+          "@ | Set-Content -Path .gclient -Encoding UTF8
+            git clone --no-checkout https://chromium.googlesource.com/v8/v8.git v8
+          }
+
+      - name: Checkout V8 ${{ env.V8_VERSION }}
+        shell: bash
+        working-directory: v8src/v8
+        run: |
+          VERSION="${{ steps.vars.outputs.version }}"
+          BRANCH="${{ steps.vars.outputs.branch }}"
+          git fetch origin "refs/branch-heads/${BRANCH}:refs/remotes/branch-heads/${BRANCH}" || true
+          git fetch origin --tags || true
+          if ! git checkout -f "${VERSION}" 2>/dev/null; then
+            git checkout -f "branch-heads/${BRANCH}"
+          fi
+          [[ -f ".gn" ]] || { git reset --hard HEAD; ls .gn; }
+
+      - name: Sync dependencies
+        shell: cmd
+        working-directory: v8src
+        env:
+          VPYTHON_BYPASS: ""
+        run: |
+          set "PATH=C:\Program Files\Git\cmd;%PATH%"
+          call gclient sync -D --no-history --shallow
+          if %ERRORLEVEL% NEQ 0 (
+            pip install "httplib2[socks]" PySocks
+            python "%GITHUB_WORKSPACE%\depot_tools\gclient.py" sync -D --no-history --shallow
+          )
+
+      - name: Clean stale Windows SDK versions
+        shell: pwsh
+        run: |
+          $sdkRoot = "C:\Program Files (x86)\Windows Kits\10"
+          foreach ($sub in @("include", "lib")) {
+            $dir = Join-Path $sdkRoot $sub
+            if (Test-Path $dir) {
+              $versions = Get-ChildItem $dir -Directory | Where-Object { $_.Name -match '^\d+\.' } | Sort-Object { [version]$_.Name } -Descending
+              if ($versions.Count -gt 1) {
+                $versions | Select-Object -Skip 1 | ForEach-Object {
+                  Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                }
+              }
+            }
+          }
+
+      - name: Patch jinja2 for Python 3.10+ compatibility
+        shell: bash
+        working-directory: v8src/v8
+        run: |
+          find third_party/jinja2 third_party/markupsafe -name '*.py' -exec \
+            sed -i 's/from collections import Mapping/from collections.abc import Mapping/g' {} + 2>/dev/null || true
+          find third_party/jinja2 -name '*.py' -exec \
+            sed -i 's/collections\.Mapping/collections.abc.Mapping/g' {} + 2>/dev/null || true
+
+      - name: Patch vs_toolchain.py for VS 2022
+        shell: bash
+        working-directory: v8src/v8
+        run: |
+          VS_TOOLCHAIN="build/vs_toolchain.py"
+          if [[ -f "$VS_TOOLCHAIN" ]]; then
+            if ! grep -q "'2022'" "$VS_TOOLCHAIN" && ! grep -q "Patched for VS 2022" "$VS_TOOLCHAIN"; then
+              sed -i "/def GetVisualStudioVersion/a\\  return '2019'  # Patched for VS 2022" "$VS_TOOLCHAIN"
+            fi
+          fi
+
+      - name: Patch setup_toolchain.py for cross-drive relpath
+        shell: bash
+        working-directory: v8src/v8
+        run: |
+          SETUP_TC="build/toolchain/win/setup_toolchain.py"
+          if [[ -f "$SETUP_TC" ]] && ! grep -q "_safe_relpath" "$SETUP_TC"; then
+            cat > /tmp/patch_relpath.py << 'PYEOF'
+          import sys
+          tc = sys.argv[1]
+          with open(tc, "r") as f:
+              content = f.read()
+          lines = content.splitlines(True)
+          insert_at = 0
+          for i, line in enumerate(lines):
+              if "from __future__" in line:
+                  insert_at = i + 1
+          le = "\r\n" if "\r\n" in content else "\n"
+          patch = le.join([
+              "import os as _os_module",
+              "_orig_relpath = _os_module.path.relpath",
+              "def _safe_relpath(path, start=_os_module.curdir):",
+              "    try:",
+              "        return _orig_relpath(path, start)",
+              "    except ValueError:",
+              "        return _os_module.path.abspath(path)",
+              "_os_module.path.relpath = _safe_relpath",
+          ]) + le
+          lines.insert(insert_at, patch)
+          with open(tc, "w") as f:
+              f.writelines(lines)
+          PYEOF
+            python3 /tmp/patch_relpath.py "$SETUP_TC"
+          fi
+
+          # Strip stale SDK version args from _LoadEnvFromBat
+          if [[ -f "$SETUP_TC" ]] && grep -q "def _LoadEnvFromBat" "$SETUP_TC" && ! grep -q "strip stale SDK" "$SETUP_TC"; then
+            sed -i '/def _LoadEnvFromBat/a\  import re as _re; args = [a for a in args if not (_re.match(r"10\\.0\\.\\d+\\.\\d+", str(a)))]  # strip stale SDK' "$SETUP_TC"
+          fi
+
+          # Tolerate missing SDK paths
+          if [[ -f "$SETUP_TC" ]] && grep -q "if not os.path.exists" "$SETUP_TC"; then
+            sed -i 's/if not os\.path\.exists(/if False and os.path.exists(/' "$SETUP_TC"
+          fi
+
+      - name: Patch tool_wrapper.py for Python 3
+        if: ${{ fromJson(steps.vars.outputs.major) < 11 }}
+        shell: bash
+        working-directory: v8src/v8
+        run: |
+          TW="build/toolchain/win/tool_wrapper.py"
+          if [[ -f "$TW" ]] && ! grep -q "startswith.*b'" "$TW"; then
+            sed -i "s/line\.startswith('/line.startswith(b'/g" "$TW"
+            sed -i "s/line\.strip() == ''/line.strip() == b''/g" "$TW"
+          fi
+
+      - name: Create vcvarsall.bat wrapper
+        shell: pwsh
+        run: |
+          $vsBase = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+          $target = "$vsBase\VC\vcvarsall.bat"
+          $real = "$vsBase\VC\Auxiliary\Build\vcvarsall.bat"
+          if (!(Test-Path $target) -and (Test-Path $real)) {
+            Set-Content -Path $target -Value '@call "%~dp0Auxiliary\Build\vcvarsall.bat" %*' -Encoding ASCII
+          }
+
+      - name: Apply v8dasm disassembly patches
+        shell: bash
+        working-directory: v8src/v8
+        run: |
+          # The patch script uses bash+python3; Git Bash provides both on Windows
+          chmod +x "${{ github.workspace }}/patches/apply-v8-patches.sh"
+          "${{ github.workspace }}/patches/apply-v8-patches.sh" "$PWD"
+
+      - name: Build V8 (static library with disassembler)
+        shell: cmd
+        working-directory: v8src\v8
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+
+          rem Detect Windows SDK version
+          set "WindowsSDKVersion="
+          for /f "tokens=*" %%d in ('dir /b /ad "C:\Program Files (x86)\Windows Kits\10\include\" 2^>nul') do (
+            if exist "C:\Program Files (x86)\Windows Kits\10\include\%%d\um" (
+              set "WindowsSDKVersion=%%d\"
+            )
+          )
+
+          rem Find gn
+          set "GN_BIN="
+          if exist "buildtools\win\gn.exe" set "GN_BIN=buildtools\win\gn.exe"
+          if not defined GN_BIN (
+            mkdir "buildtools\win" 2>nul
+            curl -sL "https://chrome-infra-packages.appspot.com/dl/gn/gn/windows-amd64/+/latest" -o "%TEMP%\gn.zip"
+            tar -xf "%TEMP%\gn.zip" -C "buildtools\win"
+            set "GN_BIN=buildtools\win\gn.exe"
+          )
+
+          rem Find ninja
+          set "NINJA_BIN="
+          if exist "third_party\ninja\ninja.exe" set "NINJA_BIN=third_party\ninja\ninja.exe"
+          if not defined NINJA_BIN where ninja >nul 2>&1 && set "NINJA_BIN=ninja"
+          if not defined NINJA_BIN (
+            pip install ninja
+            set "NINJA_BIN=ninja"
+          )
+
+          rem Write args.gn
+          if not exist "out\x64.release" mkdir "out\x64.release"
+          > "out\x64.release\args.gn" (
+            echo is_debug = false
+            echo target_cpu = "x64"
+            echo symbol_level = 0
+            echo v8_enable_backtrace = true
+            echo v8_enable_slow_dchecks = false
+            echo is_component_build = false
+            echo v8_static_library = true
+            echo v8_enable_disassembler = true
+            echo v8_enable_object_print = true
+            echo use_custom_libcxx = false
+            echo v8_use_external_startup_data = false
+            echo is_clang = false
+            echo treat_warnings_as_errors = false
+            echo enable_iterator_debugging = false
+          )
+
+          %GN_BIN% gen out/x64.release
+          if %ERRORLEVEL% NEQ 0 exit /b 1
+
+          rem Regenerate environment files
+          python -c "import os,glob; keys=['INCLUDE','LIB','LIBPATH','PATH','SystemRoot','TEMP','TMP','PATHEXT']; block=''.join(k+'='+os.environ[k]+chr(0) for k in keys if k in os.environ)+chr(0); [open(f,'w').write(block) for f in glob.glob('out/x64.release/environment.*')]; print('Regenerated',len(glob.glob('out/x64.release/environment.*')),'environment files')"
+
+          %NINJA_BIN% -C out/x64.release wee8 v8_libbase v8_libplatform
+          if %ERRORLEVEL% NEQ 0 exit /b 1
+
+      - name: Build v8dasm
+        shell: cmd
+        working-directory: ${{ github.workspace }}
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+
+          rem Create directory structure: v8dasm expects ./v8/v8/include and ./v8/v8/out/...
+          mklink /D v8 v8src
+
+          rem Use CMake with MSVC
+          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --verbose
+
+          dir build\v8dasm.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: v8dasm-windows-${{ env.V8_VERSION }}
+          path: build/v8dasm.exe
+          retention-days: 90
+
+  # ─── Collect & Release ───
+  release:
+    needs: [build-linux, build-windows]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: v8dasm-*
+          path: collected/
+          merge-multiple: false
+        continue-on-error: true
+
+      - name: Prepare release
+        run: |
+          mkdir -p release
+          V8_VERSION="${{ github.event.inputs.v8_version || env.DEFAULT_V8_VERSION }}"
+
+          echo "=== Downloaded artifacts ==="
+          find collected/ -type f 2>/dev/null || echo "(none)"
+
+          # Collect binaries
+          for dir in collected/v8dasm-linux-*; do
+            if [[ -d "$dir" ]]; then
+              cp "$dir"/v8dasm "release/v8dasm-linux-${V8_VERSION}" 2>/dev/null || true
+              chmod +x "release/v8dasm-linux-${V8_VERSION}" 2>/dev/null || true
+            fi
+          done
+          for dir in collected/v8dasm-windows-*; do
+            if [[ -d "$dir" ]]; then
+              cp "$dir"/v8dasm.exe "release/v8dasm-windows-${V8_VERSION}.exe" 2>/dev/null || true
+            fi
+          done
+
+          echo "=== Release contents ==="
+          ls -lh release/ 2>/dev/null || echo "(empty)"
+
+      - name: Upload combined artifact
+        if: hashFiles('release/*') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: v8dasm-all-${{ github.event.inputs.v8_version || '9.4.146.24' }}
+          path: release/
+          retention-days: 90
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V8_VERSION="${{ github.event.inputs.v8_version || env.DEFAULT_V8_VERSION }}"
+          TAG="${{ github.ref_name }}"
+
+          gh release create "$TAG" \
+            --title "v8dasm - V8 ${V8_VERSION}" \
+            --notes "v8dasm bytecode disassembler built against V8 ${V8_VERSION}" \
+            --latest \
+            release/* || true
