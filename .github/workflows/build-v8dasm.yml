@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       v8_version:
-        description: 'V8 version to build against (e.g. 9.4.146.24)'
+        description: 'V8 version(s), comma-separated (e.g. 9.4.146.24,10.2.154.26)'
         required: true
         default: '9.4.146.24'
       platforms:
@@ -42,12 +42,31 @@ env:
   DEFAULT_V8_VERSION: '9.4.146.24'
 
 jobs:
+  # ─── Parse version matrix ───
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Build version matrix
+        id: set-matrix
+        run: |
+          VERSIONS="${{ github.event.inputs.v8_version || '9.4.146.24' }}"
+          # Convert comma-separated to JSON array, trimming whitespace
+          JSON=$(echo "$VERSIONS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -sc .)
+          echo "matrix={\"v8_version\":$JSON}" >> "$GITHUB_OUTPUT"
+          echo "Building versions: $JSON"
+
   # ─── Linux Build ───
   build-linux:
+    needs: prepare
     if: ${{ github.event.inputs.platforms != 'windows' }}
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     env:
-      V8_VERSION: ${{ github.event.inputs.v8_version || '9.4.146.24' }}
+      V8_VERSION: ${{ matrix.v8_version }}
 
     steps:
       - uses: actions/checkout@v5
@@ -240,10 +259,14 @@ jobs:
 
   # ─── Windows Build ───
   build-windows:
+    needs: prepare
     if: ${{ github.event.inputs.platforms != 'linux' }}
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     env:
-      V8_VERSION: ${{ github.event.inputs.v8_version || '9.4.146.24' }}
+      V8_VERSION: ${{ matrix.v8_version }}
       DEPOT_TOOLS_WIN_TOOLCHAIN: 0
       VPYTHON_BYPASS: "manually managed python not using vpython"
       GYP_MSVS_VERSION: "2019"
@@ -576,21 +599,22 @@ jobs:
       - name: Prepare release
         run: |
           mkdir -p release
-          V8_VERSION="${{ github.event.inputs.v8_version || env.DEFAULT_V8_VERSION }}"
 
           echo "=== Downloaded artifacts ==="
           find collected/ -type f 2>/dev/null || echo "(none)"
 
-          # Collect binaries
+          # Collect binaries from all versions
           for dir in collected/v8dasm-linux-*; do
             if [[ -d "$dir" ]]; then
-              cp "$dir"/v8dasm "release/v8dasm-linux-${V8_VERSION}" 2>/dev/null || true
-              chmod +x "release/v8dasm-linux-${V8_VERSION}" 2>/dev/null || true
+              VERSION=$(basename "$dir" | sed 's/v8dasm-linux-//')
+              cp "$dir"/v8dasm "release/v8dasm-linux-${VERSION}" 2>/dev/null || true
+              chmod +x "release/v8dasm-linux-${VERSION}" 2>/dev/null || true
             fi
           done
           for dir in collected/v8dasm-windows-*; do
             if [[ -d "$dir" ]]; then
-              cp "$dir"/v8dasm.exe "release/v8dasm-windows-${V8_VERSION}.exe" 2>/dev/null || true
+              VERSION=$(basename "$dir" | sed 's/v8dasm-windows-//')
+              cp "$dir"/v8dasm.exe "release/v8dasm-windows-${VERSION}.exe" 2>/dev/null || true
             fi
           done
 
@@ -601,7 +625,7 @@ jobs:
         if: hashFiles('release/*') != ''
         uses: actions/upload-artifact@v5
         with:
-          name: v8dasm-all-${{ github.event.inputs.v8_version || '9.4.146.24' }}
+          name: v8dasm-all
           path: release/
           retention-days: 90
 
@@ -610,11 +634,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          V8_VERSION="${{ github.event.inputs.v8_version || env.DEFAULT_V8_VERSION }}"
           TAG="${{ github.ref_name }}"
 
           gh release create "$TAG" \
-            --title "v8dasm - V8 ${V8_VERSION}" \
-            --notes "v8dasm bytecode disassembler built against V8 ${V8_VERSION}" \
+            --title "v8dasm - ${TAG}" \
+            --notes "v8dasm bytecode disassembler" \
             --latest \
             release/* || true
