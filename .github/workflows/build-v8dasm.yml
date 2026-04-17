@@ -554,6 +554,11 @@ jobs:
           rem Regenerate environment files
           python -c "import os,glob; keys=['INCLUDE','LIB','LIBPATH','PATH','SystemRoot','TEMP','TMP','PATHEXT']; block=''.join(k+'='+os.environ[k]+chr(0) for k in keys if k in os.environ)+chr(0); [open(f,'w').write(block) for f in glob.glob('out/x64.release/environment.*')]; print('Regenerated',len(glob.glob('out/x64.release/environment.*')),'environment files')"
 
+          rem Fix: V8 10.x has header-only source_sets (e.g. v8_heap_base_headers)
+          rem that never produce a .lib, but MSVC link steps reference them.
+          rem Create stub .lib files so the linker can find them.
+          python -c "import subprocess,os,tempfile,re;td=tempfile.gettempdir();sc=os.path.join(td,'v8stub.c');so=os.path.join(td,'v8stub.obj');open(sc,'w').write('int _v8_stub=0;\n');subprocess.check_call(['cl','/c','/nologo','/Fo'+so,sc]);nd='out/x64.release';nf=os.path.join(nd,'build.ninja');built=set();needed=set();[built.add(m.group(1)) or None for line in open(nf,'r',errors='ignore') for m in [re.match(r'^build (obj/\S+\.lib)\s*:',line)] if m];[needed.add(lib) for line in open(nf,'r',errors='ignore') if 'link' in line.lower() or '.lib' in line for lib in re.findall(r'(obj/\S+\.lib)',line)];[subprocess.check_call(['lib','/NOLOGO','/OUT:'+os.path.join(nd,l.replace('/',os.sep)),so]) or print('Created stub:',l) for l in needed-built if not os.path.exists(os.path.join(nd,l.replace('/',os.sep)))]" 2>nul || echo No stub libs needed
+
           %NINJA_BIN% -C out/x64.release wee8 v8_libbase v8_libplatform
           if %ERRORLEVEL% NEQ 0 exit /b 1
 
