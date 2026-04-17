@@ -17,6 +17,18 @@ on:
         description: 'V8 version(s), comma-separated (e.g. 9.4.146.24,10.2.154.26)'
         required: true
         default: '9.4.146.24'
+      build_profile:
+        description: 'Build profile (pointer compression / code space flags)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - all
+          - node18
+          - chrome
+          - minimal
+          - nocompress
       platforms:
         description: 'Platforms to build'
         required: false
@@ -42,20 +54,63 @@ env:
   DEFAULT_V8_VERSION: '9.4.146.24'
 
 jobs:
-  # ─── Parse version matrix ───
+  # ─── Parse version × profile matrix ───
   prepare:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Build version matrix
+      - name: Build version × profile matrix
         id: set-matrix
         run: |
           VERSIONS="${{ github.event.inputs.v8_version || '9.4.146.24' }}"
-          # Convert comma-separated to JSON array, trimming whitespace
-          JSON=$(echo "$VERSIONS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -sc .)
-          echo "matrix={\"v8_version\":$JSON}" >> "$GITHUB_OUTPUT"
-          echo "Building versions: $JSON"
+          PROFILE="${{ github.event.inputs.build_profile || 'auto' }}"
+
+          # Convert comma-separated versions to array
+          VERSION_JSON=$(echo "$VERSIONS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -sc .)
+
+          # Build profile definitions (GN args + CMake defines)
+          # Each profile is: name|gn_pointer_args|cmake_extra_defines
+          #
+          # Profiles:
+          #   nocompress - No pointer compression (rare, 32-bit or custom)
+          #   minimal    - V8_COMPRESS_POINTERS only (V8 8-9 default)
+          #   node18     - Node.js 18 / pkg (compress + shared cage + external code space)
+          #   chrome     - Chrome / Electron (compress + shared cage + external code + sandbox ext ptrs)
+
+          if [[ "$PROFILE" == "all" ]]; then
+            PROFILES='["nocompress","minimal","node18","chrome"]'
+          elif [[ "$PROFILE" == "auto" ]]; then
+            # Pick the right profile based on V8 major version
+            # For mixed versions, build all relevant profiles
+            HAS_OLD=false
+            HAS_NEW=false
+            for v in $(echo "$VERSIONS" | tr ',' ' '); do
+              MAJOR=$(echo "$v" | cut -d'.' -f1)
+              if [[ "$MAJOR" -lt 10 ]]; then
+                HAS_OLD=true
+              else
+                HAS_NEW=true
+              fi
+            done
+            if $HAS_OLD && $HAS_NEW; then
+              PROFILES='["minimal","node18"]'
+            elif $HAS_NEW; then
+              PROFILES='["node18"]'
+            else
+              PROFILES='["minimal"]'
+            fi
+          else
+            PROFILES="[\"$PROFILE\"]"
+          fi
+
+          echo "Versions: $VERSION_JSON"
+          echo "Profiles: $PROFILES"
+
+          # Combine into matrix
+          MATRIX=$(jq -nc --argjson v "$VERSION_JSON" --argjson p "$PROFILES" '{v8_version: $v, build_profile: $p}')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $MATRIX"
 
   # ─── Linux Build ───
   build-linux:
@@ -67,6 +122,7 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     env:
       V8_VERSION: ${{ matrix.v8_version }}
+      BUILD_PROFILE: ${{ matrix.build_profile }}
 
     steps:
       - uses: actions/checkout@v5
@@ -212,10 +268,40 @@ jobs:
 
           echo "Using gn: $GN_BIN"
           echo "Using ninja: $NINJA_BIN"
+          echo "Build profile: ${BUILD_PROFILE}"
 
-          $GN_BIN gen out/x64.release --args='
+          # Profile-specific GN args for pointer compression / code space
+          case "${BUILD_PROFILE}" in
+            nocompress)
+              PROFILE_ARGS='v8_enable_pointer_compression = false'
+              ;;
+            minimal)
+              PROFILE_ARGS='v8_enable_pointer_compression = true'
+              ;;
+            node18)
+              PROFILE_ARGS='
+                v8_enable_pointer_compression = true
+                v8_enable_pointer_compression_shared_cage = true
+                v8_enable_external_code_space = true
+              '
+              ;;
+            chrome)
+              PROFILE_ARGS='
+                v8_enable_pointer_compression = true
+                v8_enable_pointer_compression_shared_cage = true
+                v8_enable_external_code_space = true
+                v8_enable_sandboxed_external_pointers = true
+                v8_enable_short_builtin_calls = true
+              '
+              ;;
+            *)
+              PROFILE_ARGS='v8_enable_pointer_compression = true'
+              ;;
+          esac
+
+          $GN_BIN gen out/x64.release --args="
             is_debug = false
-            target_cpu = "x64"
+            target_cpu = \"x64\"
             v8_enable_backtrace = true
             v8_enable_slow_dchecks = false
             v8_optimized_debug = false
@@ -227,7 +313,8 @@ jobs:
             v8_use_external_startup_data = false
             is_clang = true
             treat_warnings_as_errors = false
-          '
+            ${PROFILE_ARGS}
+          "
 
           $NINJA_BIN -C out/x64.release wee8 v8_libbase v8_libplatform
 
@@ -253,7 +340,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: v8dasm-linux-${{ env.V8_VERSION }}
+          name: v8dasm-linux-${{ env.V8_VERSION }}-${{ env.BUILD_PROFILE }}
           path: build-dasm/build/v8dasm
           retention-days: 90
 
@@ -267,6 +354,7 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     env:
       V8_VERSION: ${{ matrix.v8_version }}
+      BUILD_PROFILE: ${{ matrix.build_profile }}
       DEPOT_TOOLS_WIN_TOOLCHAIN: 0
       VPYTHON_BYPASS: "manually managed python not using vpython"
       GYP_MSVS_VERSION: "2019"
@@ -412,25 +500,6 @@ jobs:
           find third_party/jinja2 -name '*.py' -exec \
             sed -i 's/collections\.Mapping/collections.abc.Mapping/g' {} + 2>/dev/null || true
 
-      - name: Patch ICU for MSVC C++20 operator== ambiguity
-        if: ${{ fromJson(steps.vars.outputs.major) >= 11 }}
-        shell: bash
-        working-directory: v8src/v8
-        run: |
-          # MSVC with /std:c++20 generates synthesized reverse operator== candidates,
-          # causing C2666 ambiguity in ICU's Measure/UObject comparison hierarchy.
-          # Fix: add explicit operator== overloads so the compiler has an unambiguous match.
-          MEASURE_H="third_party/icu/source/i18n/unicode/measure.h"
-          if [[ -f "$MEASURE_H" ]] && ! grep -q "PATCHED_cpp20_eq" "$MEASURE_H"; then
-            echo "Patching $MEASURE_H for C++20 operator== ambiguity..."
-            # Insert an explicit Measure==Measure overload after the UObject operator==
-            sed -i '/virtual.*operator\s*==.*UObject/a\    bool operator==(const Measure& other) const { return operator==(static_cast<const UObject\&>(other)); }  \/\/ PATCHED_cpp20_eq' "$MEASURE_H"
-            echo "Verifying patch:"
-            grep -n "PATCHED_cpp20_eq" "$MEASURE_H"
-          else
-            echo "$MEASURE_H already patched or not found."
-          fi
-
       - name: Patch vs_toolchain.py for VS 2022
         shell: bash
         working-directory: v8src/v8
@@ -548,7 +617,7 @@ jobs:
             set "NINJA_BIN=ninja"
           )
 
-          rem Write args.gn
+          rem Write args.gn with profile-specific pointer compression flags
           if not exist "out\x64.release" mkdir "out\x64.release"
           > "out\x64.release\args.gn" (
             echo is_debug = false
@@ -567,16 +636,35 @@ jobs:
             echo enable_iterator_debugging = false
           )
 
+          rem Append profile-specific args
+          set "BP=%BUILD_PROFILE%"
+          if "%BP%"=="nocompress" (
+            >> "out\x64.release\args.gn" echo v8_enable_pointer_compression = false
+          )
+          if "%BP%"=="minimal" (
+            >> "out\x64.release\args.gn" echo v8_enable_pointer_compression = true
+          )
+          if "%BP%"=="node18" (
+            >> "out\x64.release\args.gn" echo v8_enable_pointer_compression = true
+            >> "out\x64.release\args.gn" echo v8_enable_pointer_compression_shared_cage = true
+            >> "out\x64.release\args.gn" echo v8_enable_external_code_space = true
+          )
+          if "%BP%"=="chrome" (
+            >> "out\x64.release\args.gn" echo v8_enable_pointer_compression = true
+            >> "out\x64.release\args.gn" echo v8_enable_pointer_compression_shared_cage = true
+            >> "out\x64.release\args.gn" echo v8_enable_external_code_space = true
+            >> "out\x64.release\args.gn" echo v8_enable_sandboxed_external_pointers = true
+            >> "out\x64.release\args.gn" echo v8_enable_short_builtin_calls = true
+          )
+
+          echo === args.gn ===
+          type "out\x64.release\args.gn"
+
           %GN_BIN% gen out/x64.release
           if %ERRORLEVEL% NEQ 0 exit /b 1
 
           rem Regenerate environment files
           python -c "import os,glob; keys=['INCLUDE','LIB','LIBPATH','PATH','SystemRoot','TEMP','TMP','PATHEXT']; block=''.join(k+'='+os.environ[k]+chr(0) for k in keys if k in os.environ)+chr(0); [open(f,'w').write(block) for f in glob.glob('out/x64.release/environment.*')]; print('Regenerated',len(glob.glob('out/x64.release/environment.*')),'environment files')"
-
-          rem Fix: V8 10.x has header-only source_sets (e.g. v8_heap_base_headers)
-          rem that never produce a .lib, but MSVC link steps reference them.
-          rem Create stub .lib files so the linker can find them.
-          python -c "import subprocess,os,tempfile,re;td=tempfile.gettempdir();sc=os.path.join(td,'v8stub.c');so=os.path.join(td,'v8stub.obj');open(sc,'w').write('int _v8_stub=0;\n');subprocess.check_call(['cl','/c','/nologo','/Fo'+so,sc]);nd='out/x64.release';nf=os.path.join(nd,'build.ninja');built=set();needed=set();[built.add(m.group(1)) or None for line in open(nf,'r',errors='ignore') for m in [re.match(r'^build (obj/\S+\.lib)\s*:',line)] if m];[needed.add(lib) for line in open(nf,'r',errors='ignore') if 'link' in line.lower() or '.lib' in line for lib in re.findall(r'(obj/\S+\.lib)',line)];[subprocess.check_call(['lib','/NOLOGO','/OUT:'+os.path.join(nd,l.replace('/',os.sep)),so]) or print('Created stub:',l) for l in needed-built if not os.path.exists(os.path.join(nd,l.replace('/',os.sep)))]" 2>nul || echo No stub libs needed
 
           %NINJA_BIN% -C out/x64.release wee8 v8_libbase v8_libplatform
           if %ERRORLEVEL% NEQ 0 exit /b 1
@@ -591,7 +679,7 @@ jobs:
           mklink /D v8 v8src
 
           rem Use CMake with MSVC
-          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release -DV8_OUT_DIR="%CD%\v8\v8\out\x64.release"
           cmake --build build --verbose
 
           dir build\v8dasm.exe
@@ -599,7 +687,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: v8dasm-windows-${{ env.V8_VERSION }}
+          name: v8dasm-windows-${{ env.V8_VERSION }}-${{ env.BUILD_PROFILE }}
           path: build/v8dasm.exe
           retention-days: 90
 
