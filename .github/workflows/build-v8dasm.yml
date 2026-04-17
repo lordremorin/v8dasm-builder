@@ -403,6 +403,25 @@ jobs:
             }
           }
 
+      - name: Patch MSVC STL for clang compatibility
+        if: ${{ fromJson(steps.vars.outputs.major) >= 11 }}
+        shell: pwsh
+        run: |
+          # V8 >= 11 uses is_clang = true (bundled clang-cl). Older bundled
+          # clang (< 19) triggers MSVC STL's version check #error.
+          # Define _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH to suppress it.
+          $headers = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\*\include\yvals_core.h" -ErrorAction SilentlyContinue
+          foreach ($h in $headers) {
+            $content = Get-Content $h -Raw
+            if ($content -match '_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH') {
+              $patched = "#define _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`r`n" + $content
+              Set-Content $h $patched -NoNewline
+              Write-Host "Patched $h"
+            } else {
+              Write-Host "$h does not have the version check (no patch needed)"
+            }
+          }
+
       - name: Patch jinja2 for Python 3.10+ compatibility
         shell: bash
         working-directory: v8src/v8
@@ -411,6 +430,71 @@ jobs:
             sed -i 's/from collections import Mapping/from collections.abc import Mapping/g' {} + 2>/dev/null || true
           find third_party/jinja2 -name '*.py' -exec \
             sed -i 's/collections\.Mapping/collections.abc.Mapping/g' {} + 2>/dev/null || true
+
+      - name: Patch clang -fmsc-version for MSVC STL compatibility
+        if: ${{ fromJson(steps.vars.outputs.major) >= 11 }}
+        shell: bash
+        working-directory: v8src/v8
+        run: |
+          MSVC_TOOLSET=$(ls -d "/c/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC/"*/ 2>/dev/null | tail -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+          if [[ -n "$MSVC_TOOLSET" ]]; then
+            MSVC_MINOR=$(echo "$MSVC_TOOLSET" | cut -d. -f2)
+            MSVC_VER=$((1900 + MSVC_MINOR))
+          else
+            MSVC_VER="1944"
+          fi
+          echo "Detected MSVC toolset: $MSVC_TOOLSET -> _MSC_VER: $MSVC_VER"
+          for dir in build/config build/toolchain; do
+            find "$dir" -name '*.gn' -o -name '*.gni' | xargs grep -l 'fmsc-version' 2>/dev/null || true
+          done | sort -u | while read f; do
+            echo "Patching $f"
+            sed -i "s/-fmsc-version=1[0-9][0-9][0-9]/-fmsc-version=$MSVC_VER/g" "$f"
+          done
+
+      - name: Patch MSVC STL <memory> for clang private-member errors
+        if: ${{ fromJson(steps.vars.outputs.major) >= 11 }}
+        shell: pwsh
+        run: |
+          $pyScript = @'
+          import sys, os
+          path = sys.argv[1]
+          with open(path, 'r', encoding='utf-8-sig') as f:
+              content = f.read()
+          if 'PATCHED_public_for_clang' in content:
+              print(f'<memory> already patched in {path}')
+              sys.exit(0)
+          if '_Set_ptr_rep_and_enable_shared' not in content:
+              print(f'_Set_ptr_rep_and_enable_shared not found in {path}')
+              sys.exit(0)
+          le = '\r\n' if '\r\n' in content else '\n'
+          lines = content.split(le)
+          patched = False
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if not stripped.startswith('void _Set_ptr_rep_and_enable_shared'):
+                  continue
+              if '::_Set_ptr_rep_and_enable_shared' in line:
+                  continue
+              insert_at = i
+              if i > 0 and 'template' in lines[i - 1] and '<' in lines[i - 1]:
+                  insert_at = i - 1
+              indent = lines[insert_at][:len(lines[insert_at]) - len(lines[insert_at].lstrip())]
+              lines.insert(insert_at, indent + 'public: // PATCHED_public_for_clang')
+              patched = True
+              print(f'Inserted public: before line {insert_at + 1} in {path}')
+              break
+          if patched:
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(le.join(lines))
+              print(f'Saved patched {path}')
+          else:
+              print(f'No in-class _Set_ptr_rep_and_enable_shared found in {path} (skipping)')
+          '@
+          $pyScript | Set-Content -Path "$env:TEMP\patch_memory.py" -Encoding UTF8
+          $memHeaders = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\*\include\memory" -ErrorAction SilentlyContinue
+          foreach ($m in $memHeaders) {
+            python "$env:TEMP\patch_memory.py" "$($m.FullName)"
+          }
 
       - name: Patch vs_toolchain.py for VS 2022
         shell: bash
@@ -530,7 +614,10 @@ jobs:
           )
 
           rem Write args.gn
+          rem V8 >= 11: use bundled clang-cl (avoids MSVC C++20 ICU ambiguity errors)
+          rem V8 <  11: use MSVC (bundled clang is too old, but MSVC works)
           if not exist "out\x64.release" mkdir "out\x64.release"
+          set /a V8_MAJOR=${{ steps.vars.outputs.major }}
           > "out\x64.release\args.gn" (
             echo is_debug = false
             echo target_cpu = "x64"
@@ -543,9 +630,13 @@ jobs:
             echo v8_enable_object_print = true
             echo use_custom_libcxx = false
             echo v8_use_external_startup_data = false
-            echo is_clang = false
             echo treat_warnings_as_errors = false
             echo enable_iterator_debugging = false
+          )
+          if %V8_MAJOR% GEQ 11 (
+            echo is_clang = true>> "out\x64.release\args.gn"
+          ) else (
+            echo is_clang = false>> "out\x64.release\args.gn"
           )
 
           %GN_BIN% gen out/x64.release
