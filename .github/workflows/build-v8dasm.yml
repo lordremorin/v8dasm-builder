@@ -665,8 +665,10 @@ jobs:
           %GN_BIN% gen out/x64.release
           if %ERRORLEVEL% NEQ 0 exit /b 1
 
-          rem Create empty .lib stubs for header-only GN targets that produce no
-          rem output on MSVC but are referenced in link lines (V8 10.x+)
+          rem Create proper empty .lib stubs for header-only GN targets that produce
+          rem no output on MSVC but are referenced in link lines (V8 10.x+)
+          echo // empty > "%TEMP%\empty.c"
+          cl /c /nologo /Fo"%TEMP%\empty.obj" "%TEMP%\empty.c"
           for %%L in (
             v8_heap_base_headers
             cppgc_base_headers
@@ -675,8 +677,8 @@ jobs:
             v8_flags
           ) do (
             if not exist "out\x64.release\obj\%%L.lib" (
-              echo Creating empty stub: obj\%%L.lib
-              python -c "open(r'out/x64.release/obj/%%L.lib','wb').write(b'!<arch>\n')"
+              echo Creating stub lib: obj\%%L.lib
+              lib /NOLOGO /MACHINE:X64 /OUT:"out\x64.release\obj\%%L.lib" "%TEMP%\empty.obj"
             )
           )
 
