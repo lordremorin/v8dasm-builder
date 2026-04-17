@@ -290,6 +290,7 @@ jobs:
                 v8_enable_pointer_compression = true
                 v8_enable_pointer_compression_shared_cage = true
                 v8_enable_external_code_space = true
+                v8_enable_sandbox = true
                 v8_enable_sandboxed_external_pointers = true
                 v8_enable_short_builtin_calls = true
               '
@@ -653,6 +654,7 @@ jobs:
             >> "out\x64.release\args.gn" echo v8_enable_pointer_compression = true
             >> "out\x64.release\args.gn" echo v8_enable_pointer_compression_shared_cage = true
             >> "out\x64.release\args.gn" echo v8_enable_external_code_space = true
+            >> "out\x64.release\args.gn" echo v8_enable_sandbox = true
             >> "out\x64.release\args.gn" echo v8_enable_sandboxed_external_pointers = true
             >> "out\x64.release\args.gn" echo v8_enable_short_builtin_calls = true
           )
@@ -662,6 +664,21 @@ jobs:
 
           %GN_BIN% gen out/x64.release
           if %ERRORLEVEL% NEQ 0 exit /b 1
+
+          rem Create empty .lib stubs for header-only GN targets that produce no
+          rem output on MSVC but are referenced in link lines (V8 10.x+)
+          for %%L in (
+            v8_heap_base_headers
+            cppgc_base_headers
+            v8_headers
+            v8_shared_internal_headers
+            v8_flags
+          ) do (
+            if not exist "out\x64.release\obj\%%L.lib" (
+              echo Creating empty stub: obj\%%L.lib
+              python -c "open(r'out/x64.release/obj/%%L.lib','wb').write(b'!<arch>\n')"
+            )
+          )
 
           rem Regenerate environment files
           python -c "import os,glob; keys=['INCLUDE','LIB','LIBPATH','PATH','SystemRoot','TEMP','TMP','PATHEXT']; block=''.join(k+'='+os.environ[k]+chr(0) for k in keys if k in os.environ)+chr(0); [open(f,'w').write(block) for f in glob.glob('out/x64.release/environment.*')]; print('Regenerated',len(glob.glob('out/x64.release/environment.*')),'environment files')"
