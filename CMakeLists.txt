@@ -6,10 +6,35 @@ set(CMAKE_CXX_STANDARD 17)
 include_directories(./v8/v8/include)
 add_executable(v8dasm v8dasm.cpp)
 
-# V8_COMPRESS_POINTERS is enabled by default on x64 V8 builds.
-# V8_ENABLE_SANDBOX only exists in V8 11+; uncomment if targeting that version.
+# Auto-detect V8 major version from headers to set correct compile-time defines.
+# These MUST match the V8 build that produced the .jsc file, or deserialization
+# crashes with "unreachable code".
+set(V8_INCLUDE_DIR "./v8/v8/include")
+set(V8_MAJOR 9)
+foreach(_header "v8-version.h" "v8.h")
+    if(EXISTS "${V8_INCLUDE_DIR}/${_header}")
+        file(STRINGS "${V8_INCLUDE_DIR}/${_header}" _v8_major_line REGEX "#define V8_MAJOR_VERSION")
+        if(_v8_major_line)
+            string(REGEX MATCH "[0-9]+" V8_MAJOR "${_v8_major_line}")
+            break()
+        endif()
+    endif()
+endforeach()
+message(STATUS "Detected V8 major version: ${V8_MAJOR}")
+
+# V8 8+: pointer compression on x64
 add_definitions(-DV8_COMPRESS_POINTERS)
-# add_definitions(-DV8_ENABLE_SANDBOX)
+
+# V8 10+: shared cage and external code space (used by Node 18 / pkg)
+if(V8_MAJOR GREATER_EQUAL 10)
+    add_definitions(-DV8_COMPRESS_POINTERS_IN_SHARED_CAGE)
+    add_definitions(-DV8_EXTERNAL_CODE_SPACE)
+endif()
+
+# V8 11+: full sandbox
+if(V8_MAJOR GREATER_EQUAL 11)
+    add_definitions(-DV8_ENABLE_SANDBOX)
+endif()
 
 if(WIN32)
     add_definitions(-D_ITERATOR_DEBUG_LEVEL=0)
